@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TCON, APIC, TLEN, TXXX, PRIV
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TCON, APIC, TLEN, TXXX, PRIV, USLT
 
 FORMAT_CODECS = {
     'mp3': 'libmp3lame', 'flac': 'flac', 'wav': 'pcm_s16le', 'ogg': 'libvorbis',
@@ -660,59 +660,194 @@ class ModificationWorker(threading.Thread):
             f"acrusher=level_in={drive_clamped:.2f}:level_out=1:bits=14:mode=log:mix={mix_clamped:.2f}"
         )
 
+    def _build_micro_pitch_filter(self, cents, audio_path=None):
+        """Сдвигает высоту тона на cents центов (1 semitone = 100 cents).
+        4 cents — полностью ниже JND слуха, но сдвигает ВСЕ spectral peaks
+        одновременно, делая все fingerprint-хэши невалидными."""
+        sr = self._get_sample_rate(audio_path) if audio_path else 44100
+        shifted_sr = round(sr * (2 ** (cents / 1200)))
+        return f"asetrate={shifted_sr},aresample={sr}:resampler=soxr:precision=28"
+
     def _build_temporal_jitter_filter(self, intensity=0.002, frequency=0.5):
         freq_clamped = max(0.1, min(20.0, frequency))
         delay = max(0.1, min(5.0, intensity * 2000))
         decay = min(0.3, intensity * 50)
         return f"aphaser=type=t:delay={delay:.2f}:decay={decay:.3f}:speed={freq_clamped:.2f}:out_gain=0.9"
 
+    @staticmethod
+    def _spread_frequencies(pool, n, min_octave_gap=0.5):
+        """
+        Выбирает n частот из pool с минимальным расстоянием min_octave_gap октав.
+        Если с ограничением не набрать n — снижает порог вдвое и пробует снова.
+        Если n > len(pool) — добирает оставшееся с небольшим случайным сдвигом (±3%).
+        """
+        import math
+        candidates = list(pool)
+        random.shuffle(candidates)
+
+        def _pick(gap):
+            sel = []
+            for f in candidates:
+                if not any(abs(math.log2(f / s)) < gap for s in sel):
+                    sel.append(f)
+                if len(sel) >= n:
+                    break
+            return sel
+
+        selected = _pick(min_octave_gap)
+        # Если не набрали — снижаем требование к расстоянию вдвое
+        if len(selected) < n:
+            selected = _pick(min_octave_gap / 2)
+        # Если всё равно не хватает (n > len(pool)) — добираем с ±3% сдвигом
+        if len(selected) < n:
+            rest = [f for f in candidates if f not in selected]
+            selected.extend(rest[:n - len(selected)])
+        while len(selected) < n:
+            base = random.choice(pool)
+            jitter = random.uniform(0.97, 1.03)
+            selected.append(round(base * jitter))
+        return selected
+
+    def _find_spectral_peaks(self, audio_path, n):
+        """Return top-n peak frequencies from the track's spectrum."""
+        freq_pool = [
+             60,   80,  100,  120,  160,  200,  250,  315,
+            400,  500,  630,  800, 1000, 1250, 1600, 2000,
+           2500, 3150, 4000, 5000, 6300, 7000, 8000, 9000,
+          10000, 11000, 12500, 14000, 16000, 18000, 19000, 20000,
+        ]
+        energies = self._analyze_spectrum(audio_path, freq_pool)
+        if not energies:
+            return None
+        energies.sort(key=lambda x: x[1], reverse=True)
+        return [e[0] for e in energies[:n]] or None
+
+    def _build_asendcmd_filter(self, named_notches, audio_path):
+        """Write LFO-modulation commands for named equalizers; return asendcmd filter string."""
+        duration = self._get_duration(audio_path) if audio_path else 0
+        if not duration or duration <= 0:
+            return None
+        lfo_freq = 0.15
+        lfo_depth = 1.5
+        dt = 0.4
+        lines = []
+        t = 0.0
+        n = len(named_notches)
+        while t <= duration + dt:
+            for i, (label, freq, base_att, q) in enumerate(named_notches):
+                phase = i * (2 * math.pi / n)
+                mod = lfo_depth * math.sin(2 * math.pi * lfo_freq * t + phase)
+                gain = min(-0.3, -(base_att + mod))
+                lines.append(f"{t:.1f} {label} gain {gain:.2f}")
+            t += dt
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+            tmp.write('\n'.join(lines))
+            tmp.close()
+            temp_files = getattr(self, '_run_temp_files', [])
+            temp_files.append(tmp.name)
+            safe = tmp.name.replace('\\', '/').replace(':', '\\:')
+            return f"asendcmd=filename='{safe}'"
+        except Exception:
+            return None
+
+    @staticmethod
+    def _build_shaped_noise_filter():
+        # Two pseudorandom streams, combined RMS ≈ -67 dBFS — subthreshold, inaudible
+        return "aeval=0.00145*(random(0)-0.5)+0.00075*(random(1)-0.5):c=same"
+
     def _build_spectral_jitter_filter(self, num_notches=5, max_attenuation=15, fixed_frequencies=None,
-                                       fixed_attenuation=None, manual_config=None):
+                                       fixed_attenuation=None, manual_config=None,
+                                       seed=None, min_octave_gap=0.5,
+                                       audio_path=None, adaptive=False,
+                                       compensate_boost=False, temporal_mod=False):
+        import math
+        if seed is not None:
+            random.seed(seed)
+
         filters = []
         freq_pool = [
-            120, 250, 400, 630, 800, 1200, 1600, 2000,
-            2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500
+             60,   80,  100,  120,  160,  200,  250,  315,
+            400,  500,  630,  800, 1000, 1250, 1600, 2000,
+           2500, 3150, 4000, 5000, 6300, 7000, 8000, 9000,
+          10000, 11000, 12500, 14000, 16000, 18000, 19000, 20000,
         ]
 
+        # ── Ручной режим ────────────────────────────────────────────────
         if manual_config is not None and manual_config.get('mode') == 'manual':
-            frequencies = manual_config.get('frequencies', [])
+            frequencies  = manual_config.get('frequencies', [])
             attenuations = manual_config.get('attenuations', [])
-            widths = manual_config.get('widths', [])
-            default_width = manual_config.get('fixed_width', 0.2)
+            widths       = manual_config.get('widths', [])
+            default_width = manual_config.get('fixed_width', 2.0)  # fix: было 0.2
 
             for i, freq in enumerate(frequencies):
-                att = attenuations[i] if i < len(attenuations) else max_attenuation
-                width = widths[i] if i < len(widths) else default_width
-                filters.append(f"equalizer=f={freq}:width_type=q:width={width:.3f}:g=-{att}")
+                att   = attenuations[i] if i < len(attenuations) else max_attenuation
+                width = widths[i]       if i < len(widths)       else default_width
+                filters.append(f"equalizer=f={freq}:width_type=q:width={width:.3f}:g=-{att:.1f}")
             return ", ".join(filters)
 
-        if fixed_frequencies is not None and len(fixed_frequencies) > 0:
-            selected = fixed_frequencies
-            default_width = 0.2
+        # ── Фиксированные частоты ────────────────────────────────────────
+        if fixed_frequencies:  # fix: None и [] ведут себя одинаково
+            selected = list(fixed_frequencies)
+            default_width = 2.0  # fix: было 0.2
             if manual_config and 'fixed_width' in manual_config:
                 default_width = manual_config['fixed_width']
 
+            # fix: att вычисляется один раз с явным приоритетом
+            if manual_config and 'fixed_attenuation' in manual_config:
+                att = manual_config['fixed_attenuation']
+            elif fixed_attenuation is not None:
+                att = fixed_attenuation
+            else:
+                att = max_attenuation
+
             for freq in selected:
-                att = fixed_attenuation if fixed_attenuation is not None else max_attenuation
-                if manual_config and 'fixed_attenuation' in manual_config:
-                    att = manual_config['fixed_attenuation']
-                width = default_width
-                filters.append(f"equalizer=f={freq}:width_type=q:width={width:.3f}:g=-{att}")
+                filters.append(f"equalizer=f={freq}:width_type=q:width={default_width:.3f}:g=-{att:.1f}")
+            return ", ".join(filters)
+
+        # ── Случайный режим ──────────────────────────────────────────────
+        num_notches_int = int(round(num_notches))
+        if num_notches_int <= 0:
+            return ""
+
+        # Адаптивные частоты: атакуем реальные пики спектра трека
+        if adaptive and audio_path and os.path.exists(audio_path):
+            peaks = self._find_spectral_peaks(audio_path, num_notches_int)
+            selected = peaks if peaks else self._spread_frequencies(freq_pool, num_notches_int, min_octave_gap)
         else:
-            num_notches_int = int(round(num_notches))
-            if num_notches_int <= 0:
-                return ""
-            selected = random.sample(freq_pool, min(num_notches_int, len(freq_pool)))
+            selected = self._spread_frequencies(freq_pool, num_notches_int, min_octave_gap)
 
-            for freq in selected:
-                if fixed_attenuation is not None:
-                    att = fixed_attenuation
-                else:
-                    att = random.uniform(max_attenuation / 2, max_attenuation)
-                q = random.uniform(1.5, 3.0)
-                filters.append(f"equalizer=f={freq}:width_type=q:width={q:.2f}:g=-{att:.1f}")
+        named_notches = []  # [(label, freq, att_val, q)] for temporal_mod
 
-        return ", ".join(filters)
+        for i, freq in enumerate(selected):
+            att_val = fixed_attenuation if fixed_attenuation is not None \
+                      else random.uniform(max_attenuation / 2, max_attenuation)
+
+            q = max(0.8, min(6.0, 2.0 + 0.4 * math.log2(freq / 1000)))
+            q += random.uniform(-0.2, 0.2)
+
+            if temporal_mod:
+                label = f"sj{i}"
+                filters.append(f"equalizer=f={freq}:width_type=q:width={q:.2f}:g=-{att_val:.1f}@{label}")
+                named_notches.append((f"equalizer@{label}", freq, att_val, q))
+            else:
+                filters.append(f"equalizer=f={freq}:width_type=q:width={q:.2f}:g=-{att_val:.1f}")
+
+            # Компенсирующий микроподъём на F×1.5 — сохраняет баланс
+            if compensate_boost:
+                boost_freq = min(int(round(freq * 1.5)), 20000)
+                bq = max(0.8, min(6.0, 2.0 + 0.4 * math.log2(boost_freq / 1000)))
+                filters.append(f"equalizer=f={boost_freq}:width_type=q:width={bq:.2f}:g=0.5")
+
+        result = ", ".join(filters)
+
+        # Временна́я модуляция: asendcmd-префикс для LFO ±1.5 dB
+        if temporal_mod and named_notches:
+            cmd_filter = self._build_asendcmd_filter(named_notches, audio_path)
+            if cmd_filter:
+                result = cmd_filter + "," + result
+
+        return result
 
     def _get_vk_infrasonic_expr(self, settings, extra_phase=0.0):
         freq = settings.get('vk_infrasonic_freq', 18.0)
@@ -857,9 +992,17 @@ class ModificationWorker(threading.Thread):
             fixed_freqs = self.settings.get('spectral_jitter_fixed_frequencies', None)
             fixed_att = self.settings.get('spectral_jitter_fixed_attenuation', None)
             manual_cfg = self.settings.get('spectral_jitter_manual_config', None)
-            spec_jitter = self._build_spectral_jitter_filter(num_notches, att, fixed_freqs, fixed_att, manual_cfg)
+            spec_jitter = self._build_spectral_jitter_filter(
+                num_notches, att, fixed_freqs, fixed_att, manual_cfg,
+                audio_path=current_input,
+                adaptive=self.settings.get('sj_adaptive', False),
+                compensate_boost=self.settings.get('sj_boost', False),
+                temporal_mod=self.settings.get('sj_temporal', False),
+            )
             if spec_jitter:
                 filters.append(spec_jitter)
+            if self.settings.get('sj_noise', False):
+                filters.append(self._build_shaped_noise_filter())
 
         if self.settings['methods'].get('loudnorm', False):
             target = self.settings.get('loudnorm_target', -14.0)
@@ -869,6 +1012,17 @@ class ModificationWorker(threading.Thread):
             drift = self.settings.get('resample_drift_amount', 1)
             sr = self._get_sample_rate(current_input) if current_input else 44100
             filters.append(f"asetrate={sr + drift},aresample={sr}:resampler=soxr:precision=28")
+
+        if self.settings.get('drift_variable', False):
+            filters.append("vibrato=f=0.08:d=0.002")
+
+        if self.settings.get('micro_pitch', False):
+            cents = self.settings.get('micro_pitch_cents', 4.0)
+            if self.settings.get('micro_pitch_random_sign', True):
+                cents = abs(cents) * random.choice([-1, 1])
+            pitch_f = self._build_micro_pitch_filter(cents, audio_path=current_input)
+            if pitch_f:
+                filters.append(pitch_f)
 
         if self.settings['methods'].get('dc_shift', False):
             filters.append(f"dcshift={self.settings.get('dc_shift_value', 0.000005)}")
@@ -1361,6 +1515,13 @@ class ModificationWorker(threading.Thread):
                 )
             except Exception as e:
                 self.on_error(f"Broken Duration: {e}")
+        if self.settings['methods'].get('embed_text', False):
+            embed_text = (self.settings.get('embed_text_value', '') or '').strip()
+            if embed_text:
+                try:
+                    self._apply_embed_text(output_file, embed_text)
+                except Exception as e:
+                    self.on_error(f"Вшить текст: {e}")
 
     # ------------------------------------------------------------------
     # Main processing loop
@@ -1397,6 +1558,7 @@ class ModificationWorker(threading.Thread):
                 current_input = self._apply_insert_audio(current_input, temp_files)
                 current_input = self._apply_vk_infrasonic(current_input, temp_files)
                 ultrasonic_path = self._generate_ultrasonic_track(current_input, temp_files)
+                self._run_temp_files = temp_files
                 filters = self._compute_filters(current_input)
                 cover_source_path = self._extract_cover(track_info, temp_files)
                 tags = self._resolve_tags(meta['orig'])
@@ -1451,6 +1613,13 @@ class ModificationWorker(threading.Thread):
             encoding=3, desc='meta_noise',
             text=random.getrandbits(128).to_bytes(16, 'big').hex())
         audio.save(v2_version=3, v23_sep='/', padding=lambda info: 1024)
+
+    def _apply_embed_text(self, file_path, text):
+        audio = MP3(file_path)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags['USLT::XXX'] = USLT(encoding=3, lang='XXX', desc='', text=text)
+        audio.save(v2_version=3)
 
     def _reorder_id3_tags(self, file_path):
         audio = MP3(file_path)

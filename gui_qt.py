@@ -800,8 +800,23 @@ class SpectralTab(QWidget):
         g = _grp("Дрейф частоты дискретизации")
         self.cb_resamp = QCheckBox("Включить")
         self.sp_resamp = _int(1, -100, 100)
+        self.cb_drift_variable = QCheckBox("Переменный drift (вибрато 0.08 Гц)")
+        self.cb_drift_variable.setToolTip("Медленное вибрато ±0.2% — ломает временну́ю привязку fingerprint-ориентиров")
         g.layout().addWidget(self.cb_resamp)
         g.layout().addWidget(_row(QLabel("Дрейф (Гц):"), self.sp_resamp, None))
+        g.layout().addWidget(self.cb_drift_variable)
+        lay.addWidget(g)
+
+        g = _grp("Микросдвиг тональности")
+        self.cb_micro_pitch = QCheckBox("Включить")
+        self.sp_micro_pitch = _dbl(4.0, 0.5, 12.0, 0.5, 1)
+        self.cb_micro_pitch_rand = QCheckBox("Случайный знак (±) — каждый трек по-разному")
+        self.cb_micro_pitch_rand.setToolTip(
+            "Сдвигает все спектральные пики разом — fingerprint-хэши невалидны\n"
+            "4 цента = 0.23% сдвига, ниже порога различения JND (~5-10 ц)")
+        g.layout().addWidget(self.cb_micro_pitch)
+        g.layout().addWidget(_row(QLabel("Сдвиг (центов):"), self.sp_micro_pitch, None))
+        g.layout().addWidget(self.cb_micro_pitch_rand)
         lay.addWidget(g)
 
         g = _grp("Haas-задержка (стерео расширение)")
@@ -847,6 +862,10 @@ class SpectralTab(QWidget):
             "dc_shift_value": self.sp_dc.value(),
             "resample_drift": self.cb_resamp.isChecked(),
             "resample_drift_amount": self.sp_resamp.value(),
+            "drift_variable": self.cb_drift_variable.isChecked(),
+            "micro_pitch": self.cb_micro_pitch.isChecked(),
+            "micro_pitch_cents": self.sp_micro_pitch.value(),
+            "micro_pitch_random_sign": self.cb_micro_pitch_rand.isChecked(),
             "haas_delay": self.cb_haas.isChecked(),
             "haas_delay_ms": self.sp_haas.value(),
             "ultrasonic_noise": self.cb_ultra.isChecked(),
@@ -867,6 +886,10 @@ class SpectralTab(QWidget):
         self.sp_dc.setValue(d.get("dc_shift_value", 0.000005))
         self.cb_resamp.setChecked(d.get("resample_drift", False))
         self.sp_resamp.setValue(int(d.get("resample_drift_amount", 1)))
+        self.cb_drift_variable.setChecked(d.get("drift_variable", False))
+        self.cb_micro_pitch.setChecked(d.get("micro_pitch", False))
+        self.sp_micro_pitch.setValue(d.get("micro_pitch_cents", 4.0))
+        self.cb_micro_pitch_rand.setChecked(d.get("micro_pitch_random_sign", True))
         self.cb_haas.setChecked(d.get("haas_delay", False))
         self.sp_haas.setValue(d.get("haas_delay_ms", 15.0))
         self.cb_ultra.setChecked(d.get("ultrasonic_noise", False))
@@ -952,12 +975,24 @@ class TextureTab(QWidget):
         self.cb_spec_jitter = QCheckBox("Включить")
         self.cmb_sj_mode = QComboBox()
         self.cmb_sj_mode.addItems(["Случайные", "Конструктор"])
-        self.sp_sj_count = _int(5, 1, 16)
+        self.sp_sj_count = _int(5, 1, 50)
         self.sp_sj_att = _dbl(15.0, 1.0, 40.0, 0.5, 1)
+        self.cb_sj_adaptive = QCheckBox("Адаптивные частоты (пики спектра трека)")
+        self.cb_sj_adaptive.setToolTip("Анализирует спектр и атакует именно fingerprint-ориентиры")
+        self.cb_sj_temporal = QCheckBox("Временна́я модуляция (±1.5 dB, 0.15 Гц)")
+        self.cb_sj_temporal.setToolTip("Нотчи медленно «дышат» — ломает поиск по стабильным паттернам")
+        self.cb_sj_boost = QCheckBox("Компенсирующий буст (+0.5 dB на F×1.5)")
+        self.cb_sj_boost.setToolTip("Микроподъём рядом с каждым нотчем — сохраняет спектральный баланс")
+        self.cb_sj_noise = QCheckBox("Субпороговый шум (~−67 dBFS)")
+        self.cb_sj_noise.setToolTip("Неслышимый шум нарушает fingerprint без изменения звука")
         g.layout().addWidget(self.cb_spec_jitter)
         g.layout().addWidget(_row(QLabel("Режим:"), self.cmb_sj_mode))
         g.layout().addWidget(_row(QLabel("Кол-во нотчей:"), self.sp_sj_count, None))
         g.layout().addWidget(_row(QLabel("Ослабл. (dB):"), self.sp_sj_att, None))
+        g.layout().addWidget(self.cb_sj_adaptive)
+        g.layout().addWidget(self.cb_sj_temporal)
+        g.layout().addWidget(self.cb_sj_boost)
+        g.layout().addWidget(self.cb_sj_noise)
 
         self._sj_constructor = QWidget()
         sj_lay = QVBoxLayout(self._sj_constructor)
@@ -1028,6 +1063,7 @@ class TextureTab(QWidget):
         self._sj_rows: list[dict] = []
         self._sj_constructor.hide()
         self.cmb_sj_mode.currentIndexChanged.connect(self._on_sj_mode)
+        self.sp_sj_count.valueChanged.connect(self._on_sj_count_changed)
         lay.addWidget(g)
 
         g = _grp("VK Инфразвук")
@@ -1063,10 +1099,38 @@ class TextureTab(QWidget):
 
         lay.addStretch()
 
+    def _sync_sj_count(self):
+        self.sp_sj_count.blockSignals(True)
+        self.sp_sj_count.setValue(len(self._sj_rows))
+        self.sp_sj_count.blockSignals(False)
+
     def _on_sj_mode(self, idx):
         is_constructor = (idx == 1)
         self._sj_constructor.setVisible(is_constructor)
-        self.sp_sj_count.setEnabled(not is_constructor)
+        if is_constructor:
+            self._sync_sj_count()
+
+    def _on_sj_count_changed(self, value):
+        if self.cmb_sj_mode.currentIndex() != 1:
+            return
+        _FREQ_POOL = [
+            60, 80, 120, 160, 200, 250, 315, 400, 500, 630, 800,
+            1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300,
+            7000, 8000, 9000, 10000, 12500, 14000, 16000, 18000, 20000,
+        ]
+        current = len(self._sj_rows)
+        if value > current:
+            used = {r["freq"].value() for r in self._sj_rows}
+            avail = [f for f in _FREQ_POOL if f not in used]
+            for _ in range(value - current):
+                freq = random.choice(avail) if avail else random.choice(_FREQ_POOL)
+                if freq in avail:
+                    avail.remove(freq)
+                att = round(random.uniform(self.sp_sj_att.value() / 2, self.sp_sj_att.value()), 1)
+                self._add_sj_row(freq, att, 2.0)
+        elif value < current:
+            for rdata in list(reversed(self._sj_rows))[: current - value]:
+                self._del_sj_row(rdata)
 
     def _add_sj_row(self, freq=1000.0, att=15.0, width=2.0):
         row_w = QWidget()
@@ -1087,12 +1151,16 @@ class TextureTab(QWidget):
         self._sj_rows.append(rdata)
         self._sj_rows_lay.addWidget(row_w)
         btn_del.clicked.connect(lambda: self._del_sj_row(rdata))
+        if self.cmb_sj_mode.currentIndex() == 1:
+            self._sync_sj_count()
 
     def _del_sj_row(self, rdata):
         if rdata in self._sj_rows:
             self._sj_rows.remove(rdata)
         rdata["widget"].setParent(None)
         rdata["widget"].deleteLater()
+        if self.cmb_sj_mode.currentIndex() == 1:
+            self._sync_sj_count()
 
     def _apply_sj_preset(self, rows: list):
         for rdata in list(self._sj_rows):
@@ -1102,6 +1170,7 @@ class TextureTab(QWidget):
         for freq, att, q in rows:
             self._add_sj_row(freq, att, q)
         self.cmb_sj_mode.setCurrentIndex(1)
+        self._sync_sj_count()
 
     def get_values(self) -> dict:
         mode = self.cmb_sj_mode.currentIndex()
@@ -1147,6 +1216,10 @@ class TextureTab(QWidget):
             "spectral_jitter_fixed_frequencies": fixed_freqs,
             "spectral_jitter_fixed_attenuation": fixed_att,
             "spectral_jitter_manual_config": manual_config,
+            "sj_adaptive": self.cb_sj_adaptive.isChecked(),
+            "sj_temporal": self.cb_sj_temporal.isChecked(),
+            "sj_boost": self.cb_sj_boost.isChecked(),
+            "sj_noise": self.cb_sj_noise.isChecked(),
             "_sj_rows": [
                 {"freq": r["freq"].value(), "att": r["att"].value(), "width": r["width"].value()}
                 for r in self._sj_rows
@@ -1190,6 +1263,10 @@ class TextureTab(QWidget):
         self.cb_spec_jitter.setChecked(d.get("spectral_jitter", False))
         self.sp_sj_count.setValue(int(d.get("spectral_jitter_count", 5)))
         self.sp_sj_att.setValue(d.get("spectral_jitter_attenuation", 15.0))
+        self.cb_sj_adaptive.setChecked(d.get("sj_adaptive", False))
+        self.cb_sj_temporal.setChecked(d.get("sj_temporal", False))
+        self.cb_sj_boost.setChecked(d.get("sj_boost", False))
+        self.cb_sj_noise.setChecked(d.get("sj_noise", False))
         rows_data = d.get("_sj_rows", [])
         for r in rows_data:
             self._add_sj_row(r.get("freq", 1000), r.get("att", 15), r.get("width", 2))
@@ -1379,6 +1456,19 @@ class TechnicalTab(QWidget):
         g.layout().addWidget(self.cb_reorder)
         lay.addWidget(g)
 
+        g = _grp("Вшить текст трека")
+        self.cb_embed_text = QCheckBox("Вшить текст трека (лирика, тег USLT)")
+        self.cb_embed_text.setToolTip(
+            "Записывает указанный текст в ID3-фрейм USLT (Unsynchronised Lyrics). "
+            "Именно его ВК показывает в панели «Показать текст» при прослушивании."
+        )
+        self.te_embed_text = QTextEdit()
+        self.te_embed_text.setPlaceholderText("Текст трека, который будет отображаться в ВК (кнопка «Тт»)")
+        self.te_embed_text.setFixedHeight(80)
+        g.layout().addWidget(self.cb_embed_text)
+        g.layout().addWidget(self.te_embed_text)
+        lay.addWidget(g)
+
         g = _grp("Битрейт и кодирование")
         self.cb_bitrate_j = QCheckBox("Джиттер битрейта (случайный из 192/224/256/320)")
         self.cb_frame_sh = QCheckBox("Удалить Xing/Info заголовок")
@@ -1394,6 +1484,8 @@ class TechnicalTab(QWidget):
             "reorder_tags": self.cb_reorder.isChecked(),
             "bitrate_jitter": self.cb_bitrate_j.isChecked(),
             "frame_shift": self.cb_frame_sh.isChecked(),
+            "embed_text": self.cb_embed_text.isChecked(),
+            "embed_text_value": self.te_embed_text.toPlainText(),
         }
 
     def set_values(self, d: dict):
@@ -1401,6 +1493,8 @@ class TechnicalTab(QWidget):
         self.cb_reorder.setChecked(d.get("reorder_tags", False))
         self.cb_bitrate_j.setChecked(d.get("bitrate_jitter", False))
         self.cb_frame_sh.setChecked(d.get("frame_shift", False))
+        self.cb_embed_text.setChecked(d.get("embed_text", False))
+        self.te_embed_text.setPlainText(d.get("embed_text_value", ""))
 
 
 class SystemTab(QWidget):
@@ -2275,7 +2369,9 @@ class ModifierPanel(QWidget):
                 "frame_shift":         tech["frame_shift"],
                 "fake_metadata":       tech["fake_metadata"],
                 "reorder_tags":        tech["reorder_tags"],
+                "embed_text":          tech["embed_text"],
             },
+            "embed_text_value":       tech["embed_text_value"],
             "pitch_value":            b["pitch_value"],
             "speed_value":            b["speed_value"],
             "eq_type":                b["eq_type"],
@@ -2737,6 +2833,38 @@ class MainWindow(QMainWindow):
                 if tpl_presets:
                     self.modifier_panel.names_tab.refresh_user_templates(tpl_presets)
                 self.file_panel._recent = cfg.get("recent_files", [])
+            # Дефолты, включающиеся всегда при старте
+            tt = self.modifier_panel.texture_tab
+            st = self.modifier_panel.spectral_tab
+
+            # Спектральный джиттер — аккуратный набор без слышимых артефактов
+            tt.cb_spec_jitter.setChecked(True)
+            tt.sp_sj_count.setValue(6)          # 6 нотчей — достаточно без перегруза
+            tt.sp_sj_att.setValue(7.0)          # 7 dB — ниже порога слышимости в музыке
+            tt.cb_sj_adaptive.setChecked(False)  # OFF: режет характерные частоты = слышимо
+            tt.cb_sj_temporal.setChecked(False)  # OFF: LFO создаёт pumping-эффект
+            tt.cb_sj_boost.setChecked(False)     # OFF: 6+ бустов накапливаются = неровная АЧХ
+            tt.cb_sj_noise.setChecked(True)     # субпороговый шум — −67 dBFS
+
+            # Дрейф дискретизации — 2 Гц совершенно неслышимо
+            st.cb_resamp.setChecked(True)
+            st.sp_resamp.setValue(2)
+            st.cb_drift_variable.setChecked(True)  # вибрато d=0.002 — на грани восприятия
+
+            # DC-смещение — полностью ниже порога слышимости
+            st.cb_dc.setChecked(True)
+            st.sp_dc.setValue(0.000005)
+
+            # Микросдвиг тональности — 4 цента, случайный знак
+            # Сдвигает все spectral peaks разом, делает все fingerprint-хэши невалидными
+            st.cb_micro_pitch.setChecked(True)
+            st.sp_micro_pitch.setValue(4.0)
+            st.cb_micro_pitch_rand.setChecked(True)
+
+            self.modifier_panel.advanced_tab.cb_broken.setChecked(True)
+            nt = self.modifier_panel.names_tab
+            nt._meta_override_fields["Название"].setText(" [vk.com/reuploadunder]")
+            nt._meta_append_checks["Название"].setChecked(True)
         except Exception:
             pass
 
